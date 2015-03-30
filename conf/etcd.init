@@ -42,13 +42,16 @@ ETCD_DATA_DIR="/var/lib/etcd/${ETCD_NAME}"
 test -f /etc/default/etcd && . /etc/default/etcd
 test -f /etc/etcd.conf && . /etc/etcd.conf
 
+# Expand peers based on cluster config
+PEERS=$(echo ${ETCD_INITIAL_CLUSTER} | sed -r -e 's/[a-zA-Z0-9-]*?=//g' -e 's/2380/4001/g')
+
 is_running() {
   # Returned status corresponds to init-functions script
   # 0 = process exists
   # 1 = pidfile exists, but process doesn't
   # 4 = no pidfile exists
   if [ -r "$ETCD_PIDFILE" ]; then
-    kill -0 $(cat $ETCD_PIDFILE)
+    kill -0 $(cat $ETCD_PIDFILE) >/dev/null 2>&1
     return $?
   else
     return 4
@@ -69,11 +72,33 @@ status() {
   exit $ret
 }
 
+member_add() {
+  etcdctl --no-sync --peers ${PEERS} member add ${ETCD_NAME} ${ETCD_LISTEN_PEER_URLS}
+  export ETCD_INITIAL_CLUSTER_STATE="existing"
+  sleep 2
+}
+member_remove() {
+  ID=$(etcdctl --no-sync --peers ${PEERS} member list | awk -F: "/$(hostname -s)/ {print \$1}")
+  log_begin_msg "Removing $ID from the cluster: "
+  if [ -n "$ID" ]; then
+    etcdctl --no-sync --peers ${PEERS} member remove $ID
+    log_success_msg "removed"
+  else
+    log_failure_msg "failed"
+  fi
+  sleep 2
+}
+
 start() {
   if is_running; then
     echo "$NAME is already running."
     exit 0
   fi
+
+  if [ ! -d ${ETCD_DATA_DIR} ] && $STEALTH_MODE; then
+    member_add
+  fi
+
   log_begin_msg "Starting $NAME: "
 
   if [ ! -d "$ETCD_DATA_DIR" ]; then
@@ -101,6 +126,11 @@ stop() {
     echo "Not stopping $NAME because it isn't running."
     exit 0
   fi
+
+  if [ "safestop" != "$ACTION" ] && $STEALTH_MODE; then
+    member_remove
+  fi
+
   log_begin_msg "Stopping $NAME: "
 
   killproc -p "$ETCD_PIDFILE" "$DAEMON"
@@ -113,14 +143,20 @@ stop() {
   fi
   return $RETVAL
 }
+safestop() {
+  stop
+}
 
 restart() {
+  ACTION=safestop
   stop
   sleep 1
   start
 }
 
-$1 || {
-  echo "Usage: $0 {start|stop|restart|status}"
+ACTION="$1"
+
+${ACTION} || {
+  echo "Usage: $0 {start|stop|safestop|restart|status}"
   RETVAL=1
 }
